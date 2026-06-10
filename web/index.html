@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>בניית 301 Redirects לקונימבו</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+    .card { background: #fff; border-radius: 12px; padding: 40px; width: 100%; max-width: 480px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    h1 { font-size: 22px; color: #1a1a2e; margin-bottom: 6px; }
+    .subtitle { font-size: 14px; color: #888; margin-bottom: 32px; }
+    label { display: block; font-size: 14px; font-weight: 600; color: #333; margin-bottom: 6px; }
+    .hint { font-size: 12px; color: #999; font-weight: normal; margin-right: 6px; }
+    input[type="text"], input[type="url"], input[type="password"] {
+      width: 100%; padding: 12px 14px; border: 1.5px solid #e0e0e0; border-radius: 8px;
+      font-size: 14px; margin-bottom: 20px; transition: border-color 0.2s; direction: ltr; text-align: left; }
+    input:focus { outline: none; border-color: #4f46e5; }
+    .file-drop { border: 1.5px dashed #c7d2fe; border-radius: 8px; padding: 18px 14px; text-align: center;
+      cursor: pointer; background: #f8f9ff; transition: border-color 0.2s, background 0.2s; margin-bottom: 20px; }
+    .file-drop:hover { border-color: #4f46e5; background: #eef0ff; }
+    .file-drop.has-file { border-style: solid; border-color: #16a34a; background: #f0fdf4; }
+    .file-drop .ico { font-size: 22px; color: #4f46e5; }
+    .file-drop .txt { font-size: 13px; color: #555; margin-top: 6px; }
+    .file-drop .name { font-size: 13px; color: #16a34a; font-weight: 600; margin-top: 6px; word-break: break-all; }
+    #destFile { display: none; }
+    button { width: 100%; padding: 14px; background: #4f46e5; color: #fff; border: none; border-radius: 8px;
+      font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    button:hover { background: #4338ca; }
+    button:disabled { background: #a5b4fc; cursor: not-allowed; }
+    .status { margin-top: 16px; padding: 12px 14px; border-radius: 8px; font-size: 14px; display: none; text-align: center; }
+    .status.loading { display: block; background: #eff6ff; color: #3b82f6; border: 1px solid #bfdbfe; }
+    .status.success { display: block; background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+    .status.error   { display: block; background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+    .cfg { margin-bottom: 28px; padding: 12px 14px; background: #f8f9ff; border-radius: 8px; border: 1px solid #e0e7ff; }
+    .cfg label { margin-bottom: 4px; color: #4f46e5; font-size: 12px; }
+    .cfg input { margin-bottom: 12px; font-size: 12px; border-color: #c7d2fe; }
+    .cfg input:last-child { margin-bottom: 0; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h1>בניית 301 Redirects</h1>
+  <p class="subtitle">מושך דפים מ-GA4, מצליב מול היעדים שלך, ומוריד קובץ הפניות מוכן</p>
+
+  <div class="cfg">
+    <label>כתובת ה-Webhook של Windmill</label>
+    <input type="url" id="webhookUrl" placeholder="https://app.windmill.dev/api/w/<workspace>/jobs/run_wait_result/p/u/<user>/build_301" />
+    <label>Token (אופציונלי)</label>
+    <input type="password" id="token" placeholder="windmill token" />
+  </div>
+
+  <label>כתובת האתר <span class="hint">לדוגמה: https://example.co.il</span></label>
+  <input type="url" id="siteUrl" placeholder="https://example.co.il" />
+
+  <label>GA4 Property ID <span class="hint">מספר בן 9 ספרות מ-GA4 Admin</span></label>
+  <input type="text" id="propertyId" placeholder="123456789" />
+
+  <label>רשימת היעדים של קונימבו <span class="hint">אקסל עם שם הדף + הקישור החדש</span></label>
+  <div class="file-drop" id="fileDrop" onclick="document.getElementById('destFile').click()">
+    <div class="ico">↥</div>
+    <div class="txt">לחץ להעלאת קובץ היעדים (.xlsx)</div>
+    <div class="name" id="fileName"></div>
+  </div>
+  <input type="file" id="destFile" accept=".xlsx,.xls,.csv" onchange="onFile()" />
+
+  <button id="submitBtn" onclick="submitForm()">בנה והורד קובץ הפניות</button>
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  function onFile() {
+    const f = document.getElementById('destFile').files[0];
+    const drop = document.getElementById('fileDrop'), name = document.getElementById('fileName');
+    if (f) { drop.classList.add('has-file'); name.textContent = '✓ ' + f.name; }
+    else { drop.classList.remove('has-file'); name.textContent = ''; }
+  }
+
+  function fileToBase64(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result).split(',')[1]); // strip data: prefix
+      r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+  }
+
+  function downloadB64(b64, filename) {
+    const bin = atob(b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function submitForm() {
+    const webhookUrl = document.getElementById('webhookUrl').value.trim();
+    const token = document.getElementById('token').value.trim();
+    const siteUrl = document.getElementById('siteUrl').value.trim();
+    const propertyId = document.getElementById('propertyId').value.trim();
+    const destFile = document.getElementById('destFile').files[0];
+    const btn = document.getElementById('submitBtn');
+
+    if (!webhookUrl) return showStatus('error', 'הכנס כתובת Webhook');
+    if (!siteUrl) return showStatus('error', 'הכנס כתובת אתר');
+    if (!propertyId || !/^\d+$/.test(propertyId)) return showStatus('error', 'Property ID חייב להיות מספר');
+    if (!destFile) return showStatus('error', 'העלה את קובץ היעדים של קונימבו');
+
+    btn.disabled = true;
+    showStatus('loading', 'מושך נתונים, מצליב יעדים ובונה קובץ... אנא המתן');
+
+    try {
+      const destinations_b64 = await fileToBase64(destFile);
+      // Windmill webhook: JSON body keyed by the script's main() parameters
+      const payload = {
+        site_url: siteUrl,
+        ga4_property_id: propertyId,
+        destinations_b64: destinations_b64,
+        destinations_filename: destFile.name
+      };
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+
+      const response = await fetch(webhookUrl, { method: 'POST', headers, body: JSON.stringify(payload) });
+      if (!response.ok) throw new Error((await response.text()) || ('שגיאה ' + response.status));
+
+      // Windmill returns the script's return value. Expecting { file_b64, filename }.
+      const ct = response.headers.get('content-type') || '';
+      const fname = '301-redirects-' + siteUrl.replace(/https?:\/\//, '').replace(/[^a-z0-9]/gi, '-') + '.xlsx';
+      if (ct.includes('application/json')) {
+        const data = await response.json();
+        const b64 = data.file_b64 || data.result || data;
+        downloadB64(typeof b64 === 'string' ? b64 : '', data.filename || fname);
+      } else {
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      }
+      showStatus('success', 'הקובץ הורד בהצלחה!');
+    } catch (err) {
+      showStatus('error', 'שגיאה: ' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function showStatus(type, message) {
+    const el = document.getElementById('status');
+    el.className = 'status ' + type;
+    el.textContent = message;
+  }
+</script>
+
+</body>
+</html>
