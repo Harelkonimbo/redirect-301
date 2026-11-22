@@ -19,16 +19,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 
 def main(
-    site_url: str,
-    ga4_property_id: str,
-    destinations_b64: str,
+    site_url: str = "",
+    ga4_property_id: str = "",
+    destinations_b64: str = "",
     destinations_filename: str = "destinations.xlsx",
     google_credentials: dict = None,
     config_overrides: dict = None,
+    source_b64: str = None,
+    source_filename: str = "source.xlsx",
 ) -> dict:
     from destinations import load_destinations
     from ga4 import run_report
     from sitemap import fetch as fetch_sitemap
+    from source import load_source
     from autoconfig import detect_config
     from redirect_engine import run
     from build_xlsx import build
@@ -38,29 +41,36 @@ def main(
     if not destinations:
         raise ValueError("קובץ היעדים ריק או שלא זוהו עמודות קונימבו")
 
-    # ── 2. Fetch source rows ─────────────────────────────────────────────────
+    # ── 2. Get source rows ───────────────────────────────────────────────────
+    # Path A (n8n hand-off): source rows come from the uploaded n8n Excel.
+    # Path B (all-in-one):   fetch from GA4 + sitemap here.
     source_rows: list = []
     errors: list = []
 
-    if google_credentials:
+    if source_b64:
+        source_rows = load_source(source_b64)
+        if not source_rows:
+            raise ValueError("קובץ המקור ריק או שלא זוהתה עמודת URL")
+    else:
+        if google_credentials:
+            try:
+                ga4_rows = run_report(ga4_property_id, site_url, google_credentials)
+                source_rows.extend(ga4_rows)
+            except Exception as exc:
+                errors.append(f"GA4: {exc}")
+
         try:
-            ga4_rows = run_report(ga4_property_id, site_url, google_credentials)
-            source_rows.extend(ga4_rows)
-        except Exception as exc:
-            errors.append(f"GA4: {exc}")
+            sitemap_rows = fetch_sitemap(site_url)
+            existing = {r["url"] for r in source_rows}
+            for sr in sitemap_rows:
+                if sr["url"] not in existing:
+                    source_rows.append(sr)
+        except Exception:
+            pass  # sitemap is best-effort; never fatal
 
-    try:
-        sitemap_rows = fetch_sitemap(site_url)
-        existing = {r["url"] for r in source_rows}
-        for sr in sitemap_rows:
-            if sr["url"] not in existing:
-                source_rows.append(sr)
-    except Exception:
-        pass  # sitemap is best-effort; never fatal
-
-    if not source_rows:
-        hint = f" (שגיאות: {'; '.join(errors)})" if errors else ""
-        raise ValueError(f"לא נמצאו שורות מקור — GA4 וסיטמאפ שניהם ריקים{hint}")
+        if not source_rows:
+            hint = f" (שגיאות: {'; '.join(errors)})" if errors else ""
+            raise ValueError(f"לא נמצאו שורות מקור — GA4 וסיטמאפ שניהם ריקים{hint}")
 
     # ── 3. Auto-detect config, apply overrides ───────────────────────────────
     config = detect_config(source_rows, overrides=config_overrides)
@@ -72,8 +82,9 @@ def main(
     xlsx_bytes = build(rows, stats)
 
     # ── 6. Return base64 + filename ──────────────────────────────────────────
-    slug = re.sub(r"https?://", "", site_url).rstrip("/")
-    slug = re.sub(r"[^a-z0-9א-תA-Z\-._]", "-", slug).strip("-")
+    slug_src = site_url or (source_rows[0]["url"] if source_rows else "site")
+    slug = re.sub(r"https?://", "", slug_src).rstrip("/").split("/")[0]
+    slug = re.sub(r"[^a-z0-9א-תA-Z\-._]", "-", slug).strip("-") or "site"
     filename = f"301-redirects-{slug}.xlsx"
 
     return {

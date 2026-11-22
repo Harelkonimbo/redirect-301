@@ -336,6 +336,94 @@ def load_destinations(data):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# source  (n8n hand-off: read OLD-site rows from the exported Excel, no GA4 call)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MERGED_SHEET = "מאוחד"
+
+
+def _looks_like_url(val):
+    if not isinstance(val, str):
+        return False
+    v = val.strip().lower()
+    return v.startswith("http://") or v.startswith("https://")
+
+
+def _detect_source_cols(rows):
+    ncols = max((len(r) for r in rows), default=0)
+    if ncols == 0:
+        return None, None
+    url_scores = [0] * ncols
+    for row in rows:
+        for ci, cell in enumerate(row):
+            if _looks_like_url(cell):
+                url_scores[ci] += 1
+    url_col = max(range(ncols), key=lambda i: url_scores[i])
+    if url_scores[url_col] == 0:
+        return None, None
+    title_col = None
+    for ci in range(ncols):
+        if ci == url_col:
+            continue
+        for row in rows:
+            cell = row[ci] if ci < len(row) else ""
+            if isinstance(cell, str) and cell.strip() and not _looks_like_url(cell):
+                title_col = ci
+                break
+        if title_col is not None:
+            break
+    return url_col, title_col
+
+
+def _source_records(rows):
+    url_col, title_col = _detect_source_cols(rows)
+    if url_col is None:
+        return []
+    records = []
+    for row in rows:
+        url = row[url_col] if url_col < len(row) else ""
+        if not _looks_like_url(url):
+            continue
+        title = (row[title_col] if (title_col is not None and title_col < len(row)) else "")
+        records.append({"title": title, "url": url.strip()})
+    return records
+
+
+def load_source(data):
+    if isinstance(data, str):
+        if "," in data[:60]:
+            data = data.split(",", 1)[1]
+        data = base64.b64decode(data)
+
+    records = []
+    if data[:2] == b"PK":
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        try:
+            def sheet_rows(ws):
+                return [[str(c).strip() if c is not None else "" for c in row]
+                        for row in ws.iter_rows(values_only=True)]
+            if _MERGED_SHEET in wb.sheetnames:
+                records = _source_records(sheet_rows(wb[_MERGED_SHEET]))
+            if not records:
+                for name in wb.sheetnames:
+                    records.extend(_source_records(sheet_rows(wb[name])))
+        finally:
+            wb.close()
+    else:
+        text = data.decode("utf-8-sig", errors="replace")
+        rows = [[c.strip() for c in row] for row in csv.reader(io.StringIO(text))]
+        records = _source_records(rows)
+
+    deduped, seen = [], set()
+    for rec in records:
+        if rec["url"] in seen:
+            continue
+        seen.add(rec["url"])
+        deduped.append(rec)
+    return deduped
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ga4
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -542,12 +630,14 @@ def build_xlsx(rows: list, stats: dict) -> bytes:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main(
-    site_url: str,
-    ga4_property_id: str,
-    destinations_b64: str,
+    site_url: str = "",
+    ga4_property_id: str = "",
+    destinations_b64: str = "",
     destinations_filename: str = "destinations.xlsx",
     google_credentials: dict = None,
     config_overrides: dict = None,
+    source_b64: str = None,
+    source_filename: str = "source.xlsx",
 ) -> dict:
     """
     Build a 301-redirect Excel for a Konimbo migration.
@@ -558,32 +648,40 @@ def main(
     destinations_filename : Original filename (xlsx or csv)
     google_credentials: Windmill Google resource — OAuth2 token dict or service-account JSON
     config_overrides  : Optional per-site overrides (product_segments, aliases, language_rules…)
+    source_b64        : Base64-encoded n8n export Excel. When provided, source rows are read
+                        from it (sheet `מאוחד`) and GA4/sitemap are skipped entirely.
+    source_filename   : Original filename of the source export (xlsx or csv)
     """
     # 1. Destination list
     destinations, _ = load_destinations(destinations_b64)
     if not destinations:
         raise ValueError("קובץ היעדים ריק — לא זוהו עמודות konimbo.co.il")
 
-    # 2. Source rows (GA4 primary, sitemap supplement)
+    # 2. Source rows — Path A: from the uploaded n8n export; Path B: GA4 + sitemap here.
     source_rows: list = []
     errors: list = []
 
-    if google_credentials:
+    if source_b64:
+        source_rows = load_source(source_b64)
+        if not source_rows:
+            raise ValueError("קובץ המקור ריק או שלא זוהתה עמודת URL")
+    else:
+        if google_credentials:
+            try:
+                source_rows.extend(ga4_run_report(ga4_property_id, site_url, google_credentials))
+            except Exception as exc:
+                errors.append(f"GA4: {exc}")
+
         try:
-            source_rows.extend(ga4_run_report(ga4_property_id, site_url, google_credentials))
-        except Exception as exc:
-            errors.append(f"GA4: {exc}")
+            sitemap_rows = sitemap_fetch(site_url)
+            existing = {r["url"] for r in source_rows}
+            source_rows.extend(sr for sr in sitemap_rows if sr["url"] not in existing)
+        except Exception:
+            pass  # sitemap is best-effort
 
-    try:
-        sitemap_rows = sitemap_fetch(site_url)
-        existing = {r["url"] for r in source_rows}
-        source_rows.extend(sr for sr in sitemap_rows if sr["url"] not in existing)
-    except Exception:
-        pass  # sitemap is best-effort
-
-    if not source_rows:
-        hint = f" ({'; '.join(errors)})" if errors else ""
-        raise ValueError(f"לא נמצאו שורות מקור — GA4 וסיטמאפ שניהם ריקים{hint}")
+        if not source_rows:
+            hint = f" ({'; '.join(errors)})" if errors else ""
+            raise ValueError(f"לא נמצאו שורות מקור — GA4 וסיטמאפ שניהם ריקים{hint}")
 
     # 3. Auto-detect config, apply overrides
     config = detect_config(source_rows, overrides=config_overrides)
@@ -595,8 +693,9 @@ def main(
     xlsx_bytes = build_xlsx(rows, stats)
 
     # 6. Return base64 + metadata
-    slug = re.sub(r"https?://", "", site_url).rstrip("/")
-    slug = re.sub(r"[^a-zA-Z0-9\-._]", "-", slug).strip("-")
+    slug_src = site_url or (source_rows[0]["url"] if source_rows else "site")
+    slug = re.sub(r"https?://", "", slug_src).rstrip("/").split("/")[0]
+    slug = re.sub(r"[^a-zA-Z0-9\-._]", "-", slug).strip("-") or "site"
 
     return {
         "file_b64": base64.b64encode(xlsx_bytes).decode(),
